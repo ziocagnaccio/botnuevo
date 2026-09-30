@@ -893,6 +893,18 @@ def resume():
     return jsonify({"status": "resumed"}), 200
 
 
+@app.route("/test", methods=["GET"])
+def test_telegram():
+    """Sends a test message to Telegram, and shows which wallet this bot uses."""
+    try:
+        equity = float(info.user_state(MAIN_ADDR)["marginSummary"]["accountValue"])
+    except Exception:
+        equity = -1
+    tg(f"👋 Test message. I'm Bot B (new rules).\n"
+       f"Wallet: {MAIN_ADDR[:6]}...{MAIN_ADDR[-4:]}\nBalance: ${equity:.2f}")
+    return jsonify({"status": "test sent", "wallet": MAIN_ADDR, "equity": round(equity, 2)})
+
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"ok": True, "service": "trend-bot-B"})
