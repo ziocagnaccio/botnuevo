@@ -80,7 +80,10 @@ STATE_FILE              = "state_bot_b.json"
 
 WALLET_KEY = os.environ["HL_PRIVATE_KEY"]
 MAIN_ADDR  = os.environ["HL_WALLET_ADDR"]
-TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+# TELEGRAM_TOKEN and TELEGRAM_CHAT_ID can hold several values separated by commas.
+# They are matched in order: 1st token -> 1st chat ID, 2nd token -> 2nd chat ID.
+# With only one token, that token is used for every chat ID.
+TG_TOKENS  = [t.strip() for t in os.environ.get("TELEGRAM_TOKEN", "").split(",") if t.strip()]
 TG_CHATS   = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 
 _wallet  = Account.from_key(WALLET_KEY)
@@ -106,11 +109,15 @@ state = default_state()
 
 def tg(text):
     print("[TG]", text)
-    if not TG_TOKEN or not TG_CHATS:
+    if not TG_TOKENS or not TG_CHATS:
         return
-    for chat in TG_CHATS:
+    for n, chat in enumerate(TG_CHATS):
+        token = TG_TOKENS[0] if len(TG_TOKENS) == 1 else (TG_TOKENS[n] if n < len(TG_TOKENS) else None)
+        if not token:
+            print(f"[TG] no token for chat {chat}")
+            continue
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": chat, "text": "🅱️ BOT B\n" + text}, timeout=10)
         except Exception as e:
             print(f"[TG] failed: {e}")
