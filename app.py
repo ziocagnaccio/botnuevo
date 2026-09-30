@@ -1,6 +1,8 @@
 """
 TREND BOT B — Hyperliquid (BTC / ETH) — risk-based rules
-Flow:  TradingView (3h indicators) -> n8n -> THIS app -> Hyperliquid
+NO TRADINGVIEW: the bot downloads Hyperliquid candles and calculates the
+       indicators itself. UptimeRobot opens /manage every 5 minutes: that
+       checks trades AND runs the strategy when a new 3h candle has closed.
        Telegram messages are sent directly by this app.
 
 ENTRY (all must be true, checked when a 3h candle closes):
@@ -34,7 +36,7 @@ import threading
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
@@ -112,6 +114,157 @@ def tg(text):
                           json={"chat_id": chat, "text": "🅱️ BOT B\n" + text}, timeout=10)
         except Exception as e:
             print(f"[TG] failed: {e}")
+
+# ===================== CANDLES + INDICATORS (no TradingView) =====================
+# Hyperliquid has no 3h candles, so we download 1h candles and join them 3 by 3
+# (00-03, 03-06, ... UTC). Formulas are the same as TradingView's.
+HOUR_MS        = 3600 * 1000
+CANDLE_MS      = 3 * HOUR_MS
+HISTORY_DAYS   = 60           # enough history for EMA100 / ADX to settle
+FRESH_MINUTES  = 20           # only act on a candle that closed in the last 20 min
+_last_candle   = {}           # coin -> open time of the last 3h candle already checked
+
+
+def fetch_3h_candles(coin):
+    end = int(time.time() * 1000)
+    start = end - HISTORY_DAYS * 24 * HOUR_MS
+    raw = info.candles_snapshot(coin, "1h", start, end)
+    groups = {}
+    for c in raw:
+        t = int(c["t"])
+        groups.setdefault(t - (t % CANDLE_MS), []).append(c)
+    out = []
+    for g in sorted(groups):
+        if g + CANDLE_MS > end - 30000:        # this 3h candle hasn't closed yet
+            continue
+        cs = sorted(groups[g], key=lambda c: int(c["t"]))
+        out.append({"t": g,
+                    "o": float(cs[0]["o"]), "c": float(cs[-1]["c"]),
+                    "h": max(float(c["h"]) for c in cs), "l": min(float(c["l"]) for c in cs),
+                    "v": sum(float(c["v"]) for c in cs)})
+    return out
+
+
+def _smooth(src, n, alpha):
+    """EMA / RMA like TradingView: starts with a simple average of the first n values."""
+    out, prev, buf = [None] * len(src), None, []
+    for i, x in enumerate(src):
+        if x is None:
+            continue
+        if prev is None:
+            buf.append(x)
+            if len(buf) == n:
+                prev = sum(buf) / n
+                out[i] = prev
+        else:
+            prev = alpha * x + (1 - alpha) * prev
+            out[i] = prev
+    return out
+
+
+def ind_ema(src, n):
+    return _smooth(src, n, 2.0 / (n + 1))
+
+
+def ind_rma(src, n):
+    return _smooth(src, n, 1.0 / n)
+
+
+def ind_sma(src, n):
+    out = [None] * len(src)
+    for i in range(n - 1, len(src)):
+        w = src[i - n + 1:i + 1]
+        if None not in w:
+            out[i] = sum(w) / n
+    return out
+
+
+def compute_signal(coin):
+    """Builds the same data TradingView used to send, from Hyperliquid candles."""
+    k = fetch_3h_candles(coin)
+    if len(k) < 150:
+        raise ValueError(f"not enough candles ({len(k)})")
+    o = [x["o"] for x in k]; h = [x["h"] for x in k]; l = [x["l"] for x in k]
+    c = [x["c"] for x in k]; v = [x["v"] for x in k]
+    n = len(c)
+
+    ema20, ema50, ema100 = ind_ema(c, 20), ind_ema(c, 50), ind_ema(c, 100)
+
+    # RSI 14
+    ups = [None] + [max(c[i] - c[i - 1], 0.0) for i in range(1, n)]
+    dns = [None] + [max(c[i - 1] - c[i], 0.0) for i in range(1, n)]
+    ru, rd = ind_rma(ups, 14), ind_rma(dns, 14)
+    rsi = 100.0 if rd[-1] == 0 else (0.0 if ru[-1] == 0 else 100 - 100 / (1 + ru[-1] / rd[-1]))
+
+    # MACD 12 26 9
+    e12, e26 = ind_ema(c, 12), ind_ema(c, 26)
+    macd = [a - b if a is not None and b is not None else None for a, b in zip(e12, e26)]
+    sig = ind_ema(macd, 9)
+    hist = macd[-1] - sig[-1]
+
+    def cross_up(i):
+        return macd[i] > sig[i] and macd[i - 1] <= sig[i - 1]
+
+    def cross_dn(i):
+        return macd[i] < sig[i] and macd[i - 1] >= sig[i - 1]
+
+    # ATR 14 + ADX 14
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, n)]
+    atr = ind_rma(tr, 14)
+    pdm, mdm = [None], [None]
+    for i in range(1, n):
+        up, dn = h[i] - h[i - 1], l[i - 1] - l[i]
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        mdm.append(dn if (dn > up and dn > 0) else 0.0)
+    trr = ind_rma([None] + tr[1:], 14)
+    pr, mr = ind_rma(pdm, 14), ind_rma(mdm, 14)
+    dx = []
+    for i in range(n):
+        if trr[i] is None or pr[i] is None or mr[i] is None or trr[i] == 0:
+            dx.append(None)
+            continue
+        p, m = 100 * pr[i] / trr[i], 100 * mr[i] / trr[i]
+        s = p + m
+        dx.append(abs(p - m) / (s if s != 0 else 1))
+    adx = 100 * ind_rma(dx, 14)[-1]
+
+    vavg = ind_sma(v, 20)[-1]
+    return {
+        "symbol": coin, "candle_time": k[-1]["t"],
+        "price": c[-1], "high": h[-1], "low": l[-1],
+        "ema20": ema20[-1], "ema50": ema50[-1], "ema100": ema100[-1],
+        "rsi": rsi, "macd_hist": hist,
+        "macd_up2": cross_up(n - 1) or cross_up(n - 2),
+        "macd_dn2": cross_dn(n - 1) or cross_dn(n - 2),
+        "adx": adx, "atr": atr[-1], "atr_pct": atr[-1] / c[-1] * 100,
+        "vol_ratio": (v[-1] / vavg) if vavg else 0.0,
+    }
+
+
+def candle_clock(handler):
+    """Called every 5 min: if a new 3h candle closed, run the strategy on it."""
+    results = {}
+    now = int(time.time() * 1000)
+    for coin in COINS:
+        try:
+            s = compute_signal(coin)
+        except Exception as e:
+            results[coin] = f"candle error: {e}"
+            continue
+        ct = s["candle_time"]
+        if _last_candle.get(coin) is not None and ct <= _last_candle[coin]:
+            results[coin] = "waiting for the next 3h candle"
+            continue
+        _last_candle[coin] = ct
+        if now - (ct + CANDLE_MS) > FRESH_MINUTES * 60 * 1000:
+            results[coin] = "candle too old, waiting for the next one"
+            continue
+        try:
+            results[coin] = handler(s)
+        except Exception as e:
+            results[coin] = f"error: {e}"
+    return results
+# ================================================================================
 
 # --------------------------- state ---------------------------
 
@@ -523,34 +676,6 @@ def to_bool(x):
 
 # --------------------------- routes ---------------------------
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    raw = request.get_json(force=True, silent=True) or {}
-    body = raw.get("body", raw)
-    try:
-        s = {
-            "symbol": str(body["symbol"]).upper(),
-            "price": float(body["price"]), "high": float(body["high"]), "low": float(body["low"]),
-            "ema20": float(body["ema20"]), "ema50": float(body["ema50"]), "ema100": float(body["ema100"]),
-            "rsi": float(body["rsi"]), "adx": float(body["adx"]), "atr": float(body["atr"]),
-            "macd_up2": to_bool(body["macd_up2"]), "macd_dn2": to_bool(body["macd_dn2"]),
-            "vol_ratio": float(body["vol_ratio"]),
-        }
-    except (KeyError, ValueError, TypeError) as e:
-        return jsonify({"status": "error", "reason": f"bad payload: {e}"}), 200
-
-    coin = s["symbol"]
-    if coin not in COINS:
-        return jsonify({"status": "ignored", "reason": f"{coin} not enabled"}), 200
-
-    with LOCK:
-        try:
-            return jsonify(handle_signal(coin, s)), 200
-        except Exception as e:
-            tg(f"❗ {coin}: error while handling the signal: {e}")
-            return jsonify({"status": "error", "coin": coin, "reason": str(e)}), 200
-
-
 def handle_signal(coin, s):
     if state["halted"]:
         return {"status": "halted", "reason": state["halt_reason"]}
@@ -664,6 +789,7 @@ def handle_signal(coin, s):
 def manage():
     """Called every 5 minutes by UptimeRobot: sync, backup TP1, trailing exit."""
     with LOCK:
+        actions = []
         try:
             if state["halted"]:
                 return jsonify({"status": "halted", "reason": state["halt_reason"]}), 200
@@ -672,7 +798,6 @@ def manage():
                 return jsonify({"status": "halted", "reason": state["halt_reason"]}), 200
             mids = info.all_mids()
             orders = trigger_orders()
-            actions = []
             for coin, t in list(state["trades"].items()):
                 mark = float(mids.get(coin, 0) or 0)
                 if mark <= 0:
@@ -698,9 +823,35 @@ def manage():
                     record_close(coin, "trailing exit (2 x ATR from the best price)")
                     actions.append(f"{coin} trailing exit")
             save_state()
-            return jsonify({"status": "managed", "actions": actions}), 200
         except Exception as e:
-            return jsonify({"status": "error", "reason": str(e)}), 200
+            actions.append(f"error: {e}")
+        def run_signal(s):
+            try:
+                return handle_signal(s["symbol"], s)
+            except Exception as e:
+                tg(f"❗ {s['symbol']}: error while handling the 3h candle: {e}")
+                return {"status": "error", "reason": str(e)}
+        results = candle_clock(run_signal)
+        state["last_checks"] = {c: {"result": r, "checked": datetime.now(timezone.utc).isoformat()}
+                                for c, r in results.items()}
+        save_state()
+        return jsonify({"status": "managed", "actions": actions, "candles": results}), 200
+
+
+@app.route("/signals", methods=["GET"])
+def signals():
+    """See what the bot calculates right now (no trading)."""
+    out = {}
+    for coin in COINS:
+        try:
+            s = compute_signal(coin)
+            side, why = evaluate(s)
+            s["candle_time"] = datetime.fromtimestamp(s["candle_time"] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            out[coin] = {"decision": side or "NOTHING", "why": why,
+                         **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in s.items()}}
+        except Exception as e:
+            out[coin] = {"error": str(e)}
+    return jsonify(out)
 
 
 @app.route("/status", methods=["GET"])
@@ -709,7 +860,7 @@ def status():
         equity, free, pos = account()
         risk = RISK_PCT_AFTER_STREAK if state["loss_streak"] >= LOSS_STREAK_LIMIT else RISK_PCT
         return jsonify({
-            "status": "HALTED" if state["halted"] else "running", "bot": "B (new rules)",
+            "status": "HALTED" if state["halted"] else "running", "bot": "B (new rules, no TradingView)",
             "halt_reason": state["halt_reason"], "coins": COINS,
             "leverage": f"{LEVERAGE}x isolated", "account_equity": round(equity, 2),
             "risk_per_trade_now": f"{risk * 100}%", "loss_streak": state["loss_streak"],
@@ -717,6 +868,7 @@ def status():
             "cooldowns": {c: {"hours_left": round(max(0, v["until"] - time.time()) / 3600, 2),
                               "exit_px": v["exit_px"]} for c, v in state["cooldowns"].items()},
             "last_results": state["history"][-10:],
+            "last_checks": state.get("last_checks", {}),
         })
     except Exception as e:
         return jsonify({"status": "error", "reason": str(e)}), 200
