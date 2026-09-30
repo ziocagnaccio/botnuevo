@@ -1,0 +1,5 @@
+flask
+gunicorn
+requests
+eth-account
+hyperliquid-python-sdk
