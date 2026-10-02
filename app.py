@@ -33,10 +33,11 @@ import json
 import math
 import time
 import threading
+import hashlib
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
@@ -893,6 +894,141 @@ def resume():
     return jsonify({"status": "resumed"}), 200
 
 
+# --------------------------- Telegram /balance ---------------------------
+# Wallet 1 (Bot A) address, only to READ its balance for /balance (no key needed).
+WALLET_A_ADDR = os.environ.get("WALLET_A_ADDR", "").strip()
+PUBLIC_URL    = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+
+def _tg_secret(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:32]
+
+
+def _tg_reply(n, chat, text):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKENS[n]}/sendMessage",
+                      json={"chat_id": chat, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"[TG reply] {e}")
+
+
+def wallet_snapshot(addr):
+    """Balance + open positions of any wallet (read-only)."""
+    s = info.user_state(addr)
+    equity = float(s["marginSummary"]["accountValue"])
+    positions = []
+    for p in s.get("assetPositions", []):
+        q = p.get("position", {})
+        szi = float(q.get("szi", 0) or 0)
+        if szi != 0:
+            positions.append({"coin": q.get("coin"), "side": "LONG" if szi > 0 else "SHORT",
+                              "entry": float(q.get("entryPx", 0) or 0),
+                              "upnl": float(q.get("unrealizedPnl", 0) or 0)})
+    if equity <= 0:                      # unified account: money is in the spot balance
+        try:
+            for b in info.spot_user_state(addr).get("balances", []):
+                if b.get("coin") == "USDC":
+                    equity = float(b.get("total", 0) or 0) + sum(x["upnl"] for x in positions)
+        except Exception as e:
+            print(f"[balance] spot: {e}")
+    return equity, positions
+
+
+def pnl_30d(addr):
+    """PnL of the last 30 days, the same number Hyperliquid shows as 30D PNL."""
+    try:
+        data = info.post("/info", {"type": "portfolio", "user": addr})
+        for name, d in data:
+            if name == "month":
+                h = d.get("pnlHistory", [])
+                return (float(h[-1][1]) - float(h[0][1])) if h else 0.0
+    except Exception as e:
+        print(f"[balance] portfolio: {e}")
+    try:                                  # fallback: closed trades minus fees
+        start = int(time.time() * 1000) - 30 * 24 * 3600 * 1000
+        fills = info.user_fills_by_time(addr, start)
+        return sum(float(f.get("closedPnl", 0) or 0) - float(f.get("fee", 0) or 0) for f in fills)
+    except Exception as e:
+        print(f"[balance] fills: {e}")
+        return None
+
+
+def balance_text():
+    wallets = []
+    if WALLET_A_ADDR:
+        wallets.append(("🅰️ Bot A (wallet 1)", WALLET_A_ADDR))
+    wallets.append(("🅱️ Bot B (wallet 2)", MAIN_ADDR))
+    lines, total, total_pnl = ["📊 BALANCE"], 0.0, 0.0
+    for label, addr in wallets:
+        try:
+            eq, positions = wallet_snapshot(addr)
+            pnl = pnl_30d(addr)
+            total += eq
+            lines.append(f"\n{label}\nBalance: ${eq:,.2f}")
+            if pnl is None:
+                lines.append("PnL 30 days: not available")
+            else:
+                total_pnl += pnl
+                start = eq - pnl
+                pct = f" ({pnl / start * 100:+.2f}%)" if start > 0 else ""
+                lines.append(f"PnL 30 days: {'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}{pct}")
+            if positions:
+                for p in positions:
+                    lines.append(f"Open: {p['coin']} {p['side']} @ {p['entry']} "
+                                 f"(now {'+' if p['upnl'] >= 0 else '-'}${abs(p['upnl']):,.2f})")
+            else:
+                lines.append("Open: none")
+        except Exception as e:
+            lines.append(f"\n{label}\nError reading wallet: {e}")
+    if len(wallets) > 1:
+        lines.append(f"\n💼 TOTAL: ${total:,.2f}  |  PnL 30 days: "
+                     f"{'+' if total_pnl >= 0 else '-'}${abs(total_pnl):,.2f}")
+    return "\n".join(lines)
+
+
+@app.route("/telegram/<int:n>", methods=["POST"])
+def telegram_update(n):
+    if n >= len(TG_TOKENS):
+        return "ok"
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != _tg_secret(TG_TOKENS[n]):
+        return "ok"
+    msg = (request.get_json(silent=True) or {}).get("message") or {}
+    chat = str(msg.get("chat", {}).get("id", ""))
+    text = (msg.get("text") or "").strip().lower()
+    if chat not in TG_CHATS:              # only answer the two of you
+        return "ok"
+    if text.startswith("/balance"):
+        _tg_reply(n, chat, balance_text())
+    elif text.startswith("/start") or text.startswith("/help"):
+        _tg_reply(n, chat, "Hi! Send /balance to see both wallets' balance and the PnL of the last 30 days.")
+    return "ok"
+
+
+def setup_telegram():
+    """Points every Telegram bot to this app, and adds /balance to the menu."""
+    results = []
+    if not PUBLIC_URL:
+        return ["PUBLIC_URL / RENDER_EXTERNAL_URL not set"]
+    for n, token in enumerate(TG_TOKENS):
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{token}/setWebhook", timeout=10,
+                             params={"url": f"{PUBLIC_URL}/telegram/{n}", "secret_token": _tg_secret(token),
+                                     "allowed_updates": json.dumps(["message"])}).json()
+            requests.post(f"https://api.telegram.org/bot{token}/setMyCommands", timeout=10,
+                          json={"commands": [{"command": "balance",
+                                              "description": "Balance and PnL of the last 30 days"}]})
+            results.append(f"bot {n + 1}: {'OK' if r.get('ok') else r.get('description')}")
+        except Exception as e:
+            results.append(f"bot {n + 1}: {e}")
+    print("[telegram setup]", results)
+    return results
+
+
+@app.route("/setup-telegram", methods=["GET"])
+def setup_telegram_route():
+    return jsonify({"telegram_bots": setup_telegram()})
+
+
 @app.route("/test", methods=["GET"])
 def test_telegram():
     """Sends a test message to Telegram, and shows which wallet this bot uses."""
@@ -911,6 +1047,7 @@ def home():
 
 
 load_state()
+threading.Thread(target=setup_telegram, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
